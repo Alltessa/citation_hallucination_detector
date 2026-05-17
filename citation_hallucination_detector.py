@@ -62,6 +62,12 @@ PATTERNS = {
     "multi_author": re.compile(
         r'([A-Z][a-z]+,\s+[A-Z]\.(?:,\s+[A-Z][a-z]+,\s+[A-Z]\.)*(?:,?\s+&\s+[A-Z][a-z]+,\s+[A-Z]\.)?)\s*\((\d{4})\)',
     ),
+    "semicolon_author": re.compile(        
+        r"([A-Z][a-z]+,\s+[A-Z][a-z]+(?:\s+[A-Z]\.)?)"
+        r"(?:;\s*[A-Z][a-z]+,\s+[A-Z][a-z]+(?:\s+[A-Z]\.)?)+"
+        r"\s*\((\d{4})\)\.\s*(.+?)\.",
+        re.DOTALL
+    ),
 }
 
 
@@ -138,6 +144,22 @@ def parse_citation(raw_text: str) -> Citation:
         if m:
             c.authors = c.authors or m.group(1)
             c.year = c.year or m.group(2)
+    
+    # Fallback: semicolon-separated authors 
+    if not c.title or not c.authors:
+        m = PATTERNS["semicolon_author"].search(raw_text)
+        if m:
+            c.authors = c.authors or m.group(1)
+            c.year    = c.year    or m.group(2)
+            c.title   = c.title   or m.group(3).strip()
+
+    # Fallback: (Year). Title. — grab text between year and next period
+    if not c.title:
+        m = re.search(r"\(\d{4}\)\.\s*(.+?)\.", raw_text)
+        if m:
+            candidate = m.group(1).strip()
+            if len(candidate) > 10:
+                c.title = candidate
 
     # Fallback: title from quotes
     if not c.title:
