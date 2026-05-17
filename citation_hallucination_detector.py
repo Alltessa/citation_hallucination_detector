@@ -16,6 +16,7 @@ import argparse
 import re
 import time
 import random
+from unittest import result, signals
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
@@ -230,46 +231,85 @@ def resolve_pubmed_to_url(pmid: str) -> str:
 def resolve_source(source_ref: str) -> tuple[Optional[str], Optional[str]]:
     """
     Given a source reference string, return (resolved_url, page_text).
+    page_text may be:
+      - str content  → successfully fetched
+      - "PAYWALLED"  → source returned 403 (exists but access denied)
+      - "BLOCKED"    → source returned other HTTP error
+      - None         → could not reach source at all
     Tries DOI → arXiv → PubMed → bare URL → None.
     """
-    # DOI
+
+    def _fetch_and_return(url: str) -> tuple[str, Optional[str]]:
+        """Fetch a URL and return (url, page_text_or_sentinel)."""
+        try:
+            resp = requests.get(
+                url, headers=_get_headers(), timeout=12, allow_redirects=True
+            )
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for tag in soup(["script", "style", "noscript", "meta", "head"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ", strip=True)
+            return url, text[:50_000]
+
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status == 403:
+                print(f"  [!] {url} is paywalled (403) — marking as UNVERIFIABLE")
+                return url, "PAYWALLED"
+            else:
+                print(f"  [!] {url} returned HTTP {status}")
+                return url, "BLOCKED"
+
+        except Exception as e:
+            print(f"  [!] Could not fetch {url}: {e}")
+            return url, None
+
+    # ── DOI ──────────────────────────────────────────────────────────────
     m = PATTERNS["doi"].search(source_ref)
     if m:
         doi = m.group(0)
         print(f"  [source] Resolving DOI: {doi}")
-        url = resolve_doi_to_url(doi)
-        if url:
-            print(f"  [source] DOI resolved → {url}")
-            text = fetch_page_text(url)
-            return url, text
-        print(f"  [source] DOI did not resolve.")
+        try:
+            r = requests.head(
+                f"https://doi.org/{doi}", timeout=10,
+                allow_redirects=True, headers=_get_headers()
+            )
+            if r.status_code == 403:
+                print(f"  [source] DOI landing page is paywalled (403)")
+                return r.url, "PAYWALLED"
+            if r.status_code < 400:
+                print(f"  [source] DOI resolved → {r.url}")
+                return _fetch_and_return(r.url)
+            print(f"  [source] DOI returned HTTP {r.status_code} — did not resolve")
+        except Exception as e:
+            print(f"  [source] DOI resolution failed: {e}")
 
-    # arXiv
+    # ── arXiv ─────────────────────────────────────────────────────────────
     m = PATTERNS["arxiv"].search(source_ref)
     if m:
         arxiv_id = m.group(1)
-        url = resolve_arxiv_to_url(arxiv_id)
+        url = f"https://arxiv.org/abs/{arxiv_id}"
         print(f"  [source] Fetching arXiv page: {url}")
-        text = fetch_page_text(url)
-        return url, text
+        return _fetch_and_return(url)
 
-    # PubMed
+    # ── PubMed ────────────────────────────────────────────────────────────
     m = PATTERNS["pubmed"].search(source_ref)
     if m:
         pmid = m.group(1)
-        url = resolve_pubmed_to_url(pmid)
+        url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
         print(f"  [source] Fetching PubMed page: {url}")
-        text = fetch_page_text(url)
-        return url, text
+        return _fetch_and_return(url)
 
-    # Bare URL
+    # ── Bare URL ──────────────────────────────────────────────────────────
     m = PATTERNS["url"].search(source_ref)
     if m:
         url = m.group(0)
         print(f"  [source] Fetching URL: {url}")
-        text = fetch_page_text(url)
-        return url, text
+        return _fetch_and_return(url)
 
+    # ── Nothing matched ───────────────────────────────────────────────────
+    print(f"  [source] Could not identify a resolvable identifier in: {source_ref[:80]}")
     return None, None
 
 
@@ -319,7 +359,7 @@ def citation_in_source(citation: Citation, source_text: str) -> tuple[int, list[
         elif overlap >= 0.70:
             signals += 3
             evidence.append(f"✔ Title found (>=70% token overlap: {overlap:.0%}): \"{citation.title[:80]}\"")
-        elif overlap >= 0.40:
+        elif overlap >= 0.55:
             signals += 1
             evidence.append(f"~ Partial title match ({overlap:.0%} token overlap): \"{citation.title[:80]}\"")
         else:
@@ -351,22 +391,27 @@ def citation_in_source(citation: Citation, source_text: str) -> tuple[int, list[
 
     # Author surname
     if citation.authors:
-        surname_m = re.match(r"([A-Z][a-z]+)", citation.authors)
-        if surname_m:
+        surname_m = re.search(r"([A-Z][a-z]+)(?=,|\s*$)", citation.authors) \
+            or re.match(r"([A-Z][a-z]+)", citation.authors)
+        title_overlap = _token_overlap(citation.title, source_text) if citation.title else 0.0
+        if surname_m and title_overlap >= 0.60:
             surname = surname_m.group(1)
             if surname.lower() in text_lower:
                 signals += 1
                 evidence.append(f"✔ Author surname found in source: {surname}")
             else:
                 evidence.append(f"✘ Author surname NOT found in source: {surname}")
+        elif surname_m:
+            evidence.append(f"✘ Author check skipped — title match too weak to validate surname alone")
 
     # Year
     if citation.year:
-        if citation.year in source_text:
+        title_overlap = _token_overlap(citation.title, source_text) if citation.title else 0.0
+        if citation.year in source_text and title_overlap >= 0.60:
             signals += 1
-            evidence.append(f"✔ Year found in source: {citation.year}")
+            evidence.append(f"✔ Year found in source (title also matched): {citation.year}")
         else:
-            evidence.append(f"✘ Year NOT found in source: {citation.year}")
+            evidence.append(f"✘ Year skipped — title match too weak ({title_overlap:.0%}) to count year alone")
 
     # Claim sentence — the core asserted content stripped of the parenthetical.
     # This is the most important check for inline citations like:
@@ -386,7 +431,7 @@ def citation_in_source(citation: Citation, source_text: str) -> tuple[int, list[
         elif meaningful and claim_overlap >= 0.75:
             signals += 4
             evidence.append('✔ Claim sentence strongly matches source (' + f'{claim_overlap:.0%}' + ' overlap): "' + citation.claim[:100] + '"')
-        elif meaningful and claim_overlap >= 0.50:
+        elif meaningful and claim_overlap >= 0.65:
             signals += 2
             evidence.append('~ Claim sentence partially matches source (' + f'{claim_overlap:.0%}' + ' overlap): "' + citation.claim[:100] + '"')
         elif meaningful and claim_overlap >= 0.30:
@@ -526,13 +571,27 @@ def check_openlibrary_isbn(isbn: str) -> tuple[bool, str]:
 # ─────────────────────────────────────────────
 
 # Signal thresholds for source-content matching
-_SIGNAL_STRONG   = 4   # ≥ this → REAL
-_SIGNAL_MODERATE = 2   # ≥ this → UNVERIFIABLE (borderline), < → HALLUCINATED
+_SIGNAL_STRONG   = 7  # ≥ this → REAL
+_SIGNAL_MODERATE = 4   # ≥ this → UNVERIFIABLE (borderline), < → HALLUCINATED
 
 
 class HallucinationDetector:
     def __init__(self):
         self.scraper = GoogleScraper()
+
+    def _dynamic_threshold(self, citation: Citation) -> tuple[int, int]:
+        """
+        Adjust STRONG/MODERATE thresholds based on how many
+        verifiable fields the citation has.
+        """
+        has_identifier = any([citation.doi, citation.arxiv_id, citation.pubmed_id, citation.url])
+
+        if has_identifier:
+            # DOI/arXiv/URL citations can score high — keep strict thresholds
+            return 7, 4
+        else:
+            # Title-only citations have fewer possible signals — lower thresholds
+            return 5, 3
 
     # ── Public entry point ────────────────────
 
@@ -546,16 +605,38 @@ class HallucinationDetector:
         if source:
             source_url, source_text = resolve_source(source)
 
+            # ── handle sentinels before doing any signal matching ──
+            if source_text == "PAYWALLED":
+                result.verdict    = "UNVERIFIABLE"
+                result.confidence = 0.50
+                result.evidence.append(
+                    "Source is paywalled (403) — cannot verify content. "
+                    "Citation may be real but access is restricted."
+                )
+                return result
+
+            if source_text == "BLOCKED":
+                result.verdict    = "UNVERIFIABLE"
+                result.confidence = 0.40
+                result.evidence.append(
+                    "Source server blocked the request — cannot verify content."
+                )
+                return result
+
             if source_text:
                 result.checked_via.append("Source document content")
                 signals, match_evidence = citation_in_source(citation, source_text)
                 result.evidence.extend(match_evidence)
+                
+                strong_thresh, moderate_thresh = self._dynamic_threshold(citation) 
+                
                 result.evidence.append(
                     f"Total match signals: {signals} "
-                    f"(strong≥{_SIGNAL_STRONG}, borderline≥{_SIGNAL_MODERATE})"
+                    f"(strong≥{strong_thresh}, borderline≥{moderate_thresh})"
                 )
 
-                if signals >= _SIGNAL_STRONG:
+                strong_thresh, moderate_thresh = self._dynamic_threshold(citation)
+                if signals >= strong_thresh:
                     result.verdict    = "REAL"
                     result.confidence = min(0.60 + signals * 0.06, 0.97)
                     result.evidence.insert(0,
@@ -563,7 +644,7 @@ class HallucinationDetector:
                     )
                     return result
 
-                elif signals >= _SIGNAL_MODERATE:
+                elif signals >= moderate_thresh:
                     result.verdict    = "UNVERIFIABLE"
                     result.confidence = 0.45
                     result.evidence.insert(0,
@@ -604,7 +685,6 @@ class HallucinationDetector:
         # ══════════════════════════════════════════════════════
         self._global_existence_check(citation, result)
         return result
-
     # ── Global existence check (no source) ───
 
     def _global_existence_check(self, citation: Citation, result: VerificationResult):
@@ -676,6 +756,11 @@ class HallucinationDetector:
                     result.evidence.append(f"URL live ({r.status_code}): {citation.url}")
                     result.verdict    = "REAL"
                     result.confidence = max(result.confidence, 0.75)
+                    return
+                elif r.status_code == 403:
+                    result.evidence.append(f"URL returned 403 (paywalled/blocked — cannot verify content): {citation.url}")
+                    result.verdict    = "UNVERIFIABLE"
+                    result.confidence = max(result.confidence, 0.50)
                     return
                 else:
                     result.evidence.append(f"URL returned {r.status_code}: {citation.url}")
