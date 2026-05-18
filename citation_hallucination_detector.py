@@ -62,6 +62,13 @@ PATTERNS = {
     "multi_author": re.compile(
         r'([A-Z][a-z]+,\s+[A-Z]\.(?:,\s+[A-Z][a-z]+,\s+[A-Z]\.)*(?:,?\s+&\s+[A-Z][a-z]+,\s+[A-Z]\.)?)\s*\((\d{4})\)',
     ),
+    "intext_citation": re.compile(
+        r"^(.+?)\s*\(([A-Z][a-z]+(?:\s+et\s+al\.?)?),?\s+(\d{4}[a-z]?)\)\s*\.?\s*$",
+        re.DOTALL
+    ),
+    "intext_citation_narrative": re.compile(
+        r"([A-Z][A-Za-z'’\-]+(?:\s+et\s+al\.?|\s+and\s+[A-Z][A-Za-z'’\-]+(?:\s+&\s+[A-Z][A-Za-z'’\-]+)?)?)\s*\(\s*(\d{4}[a-z]?)\s*\)",
+    ),
     "semicolon_author": re.compile(        
         r"([A-Z][a-z]+,\s+[A-Z][a-z]+(?:\s+[A-Z]\.)?)"
         r"(?:;\s*[A-Z][a-z]+,\s+[A-Z][a-z]+(?:\s+[A-Z]\.)?)+"
@@ -181,7 +188,26 @@ def parse_citation(raw_text: str) -> Citation:
             candidate = year_split[1].split(".")[0].strip()
             if len(candidate) > 10:
                 c.title = candidate
+    return c
 
+def parse_intext_citation(raw_text: str) -> Citation:
+    c = parse_citation(raw_text)
+    stripped = raw_text.strip()
+    m = PATTERNS["intext_citation"].match(stripped)
+    if m:
+        c.claim   = m.group(1).strip().strip('"\'')
+        c.authors = c.authors or m.group(2).strip()
+        c.year    = c.year    or m.group(3).strip()
+        return c
+
+    m = PATTERNS["intext_citation_narrative"].search(stripped)
+    if m:
+        c.authors = c.authors or m.group(1).strip()
+        c.year    = c.year    or m.group(2).strip()
+        citation_phrase = m.group(0)
+        claim_text = stripped.replace(citation_phrase, "").strip(" ,.")
+        if len(re.sub(r"\s+", " ", claim_text)) > 10:
+            c.claim = claim_text
     return c
 
 
@@ -602,23 +628,22 @@ class HallucinationDetector:
         self.scraper = GoogleScraper()
 
     def _dynamic_threshold(self, citation: Citation) -> tuple[int, int]:
-        """
-        Adjust STRONG/MODERATE thresholds based on how many
-        verifiable fields the citation has.
-        """
         has_identifier = any([citation.doi, citation.arxiv_id, citation.pubmed_id, citation.url])
-
         if has_identifier:
-            # DOI/arXiv/URL citations can score high — keep strict thresholds
             return 7, 4
+        elif not citation.title and citation.claim:
+            return 4, 2
         else:
-            # Title-only citations have fewer possible signals — lower thresholds
             return 5, 3
 
     # ── Public entry point ────────────────────
 
     def verify(self, raw_citation: str, source: Optional[str] = None) -> VerificationResult:
-        citation = parse_citation(raw_citation)
+        stripped_citation = raw_citation.strip()
+        if PATTERNS["intext_citation"].match(stripped_citation) or PATTERNS["intext_citation_narrative"].search(stripped_citation):
+            citation = parse_intext_citation(raw_citation)
+        else:
+            citation = parse_citation(raw_citation)
         result   = VerificationResult(citation=citation, source=source.strip() if source else None)
 
         # ══════════════════════════════════════════════════════
@@ -923,6 +948,14 @@ TEST_CASES = [
         "citation": (
             "Smith, J. & Johnson, R. (2021). Deep Quantum Neural Bridges for "
             "Multimodal Sentiment Analysis. Journal of Artificial Cognition, 14(3), 201–219."
+        ),
+    },
+    {
+        "description": "In-text citation — claim verified against source page",
+        "source": "https://arxiv.org/abs/1706.03762",
+        "citation": (
+            "The dominant sequence transduction models are based on complex recurrent "
+            "or convolutional neural networks (Vaswani et al., 2017)."
         ),
     },
 ]
